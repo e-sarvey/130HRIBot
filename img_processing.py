@@ -30,7 +30,7 @@ def obj_detection(frame):
 
     # Annotate the resized frame with bounding boxes
     annotated_resized_frame = results[0].plot()
-
+    print(results[0])
     # Calculate FPS
     curr_time = time.time()
     fps = 1 / (curr_time - prev_time)
