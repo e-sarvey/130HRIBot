@@ -2,12 +2,10 @@ import cv2
 from ultralytics import YOLO
 import time
 
-model = YOLO('yolo_models/yolo11s.pt', verbose=False)
-
+# Initialize variables
+current_model = None
+current_model_name = ""
 vid = cv2.VideoCapture(0)
-
-# Initialize time for FPS calculation
-prev_time = 0
 
 # Dictionary of detectable objects, reversed for name-to-ID mapping
 object_classes = {
@@ -28,88 +26,103 @@ object_classes = {
 # Retrieve class ID for 'person' directly from the dictionary
 PERSON_ID = object_classes['person']
 
-# Default to detect 'cup' along with 'person'
-second_object_name = 'cup'
+# Default to detect 'bottle' along with 'person'
+second_object_name = 'bottle'
 second_object_id = object_classes.get(second_object_name)
 
-# Function to calculate distance from the center of the bounding box to the center of the frame
-def getDistanceFromCenter(x_min, x_max, frame_width):
-    frame_center_x = frame_width // 2
-    object_center_x = (x_min + x_max) // 2
-    distance = object_center_x - frame_center_x
-    return distance, object_center_x
+# Function to dynamically load a model based on name
+def load_model(model_name):
+    global current_model, current_model_name
+    if current_model_name == model_name:
+        print(f"Model '{model_name}' is already loaded.")
+        return
+    model_path = f"yolo_models/{model_name}.pt"
+    current_model = YOLO(model_path, verbose=False)
+    current_model_name = model_name
+    print(f"Model '{model_name}' loaded successfully.")
 
-def obj_detection(frame):
-    global prev_time
+# Function to process frames for the detection model
+def process_detection_frame(frame):
+    global current_model
 
-    # Resize the frame to 640 pixels wide
-    original_height, original_width, _ = frame.shape
-    target_width = 640
-    target_height = int((target_width / original_width) * original_height)
+    # Resize and mirror the frame for consistency
+    target_width, target_height = 640, int(640 * frame.shape[0] / frame.shape[1])
     resized_frame = cv2.resize(frame, (target_width, target_height))
-    resized_frame = cv2.flip(resized_frame, 1) # 1 mirrors image
-    # YOLO model detection on the color frame
-    results = model(resized_frame, conf=0.6, verbose=False)
+    resized_frame = cv2.flip(resized_frame, 1)
 
-    # Filter results to include only people and the specified object
+    # YOLO model detection
+    results = current_model(resized_frame, conf=0.6, verbose=False)
+
+    # Filter for person and second selected object
     filtered_boxes = [box for box in results[0].boxes if box.cls in [PERSON_ID, second_object_id]]
-    
-    # Update results with filtered boxes only
     results[0].boxes = filtered_boxes
 
-    # Annotate the frame with bounding boxes for the specified objects
+    # Annotate frame with bounding boxes
     annotated_frame = results[0].plot()
-    
-    # Calculate FPS
-    curr_time = time.time()
-    fps = 1 / (curr_time - prev_time)
-    prev_time = curr_time
+    return annotated_frame
 
-    # Display image size and FPS
-    cv2.putText(annotated_frame, f"Size: {target_width}x{target_height}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-    cv2.putText(annotated_frame, f"FPS: {int(fps)}", (target_width - 150, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+# Function to process frames for the pose model
+def process_pose_frame(frame):
+    global current_model
 
-    # Process detections for persons and the selected object, and calculate distance from the center
-    for box in filtered_boxes:
-        x_min, y_min, x_max, y_max = map(int, box.xyxy[0])
-        distance, object_center_x = getDistanceFromCenter(x_min, x_max, target_width)
-        cv2.line(annotated_frame, (target_width // 2, target_height // 2), (object_center_x, target_height // 2), (0, 255, 0), 2)
-        cv2.putText(annotated_frame, f"Dist: {distance} px", (object_center_x, target_height // 2 - 10), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    # Resize and mirror the frame for consistency
+    target_width, target_height = 640, int(640 * frame.shape[0] / frame.shape[1])
+    resized_frame = cv2.resize(frame, (target_width, target_height))
+    resized_frame = cv2.flip(resized_frame, 1)
 
-    # Show the annotated frame
-    cv2.namedWindow("Annotated Feed", cv2.WINDOW_NORMAL)
-    cv2.setWindowProperty("Annotated Feed", cv2.WND_PROP_TOPMOST, 1)
-    cv2.imshow("Annotated Feed", annotated_frame)
+    # YOLO pose model detection
+    results = current_model(resized_frame, conf=0.6, verbose=False)
 
-# Update second_object_id based on the chosen object name (this can be modified dynamically if needed)
-def set_second_object(object_name):
-    global second_object_id
-    if object_name in object_classes:
-        second_object_id = object_classes[object_name]
-    else:
-        print(f"Object '{object_name}' not found in detectable objects.")
+    # Annotate frame with pose-specific information
+    annotated_frame = results[0].plot()
+    return annotated_frame
 
+# Function to calculate and display FPS and image size on a frame
+def annotate_fps_and_size(frame, start_time):
+    fps = 1 / (time.time() - start_time)
+    cv2.putText(frame, f"Size: {frame.shape[1]}x{frame.shape[0]}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    cv2.putText(frame, f"FPS: {int(fps)}", (frame.shape[1] - 150, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    return frame
+
+# Main loop
 try:
-    # Set up initial object detection
-    set_second_object(second_object_name)
+    # Load the default model initially
+    load_model('yolo11s')
 
-    # Make the OpenCV window stay on top
-    cv2.namedWindow("Annotated Feed", cv2.WINDOW_NORMAL)
-    cv2.setWindowProperty("Annotated Feed", cv2.WND_PROP_TOPMOST, 1)
-
+    # Main video capture loop
     while True:
+        start_time = time.time()
         ret, frame = vid.read()
         if not ret:
             break
 
-        obj_detection(frame)
+        # Process and annotate frame based on current model
+        if current_model_name == 'yolo11s':
+            annotated_frame = process_detection_frame(frame)
+        elif current_model_name == 'yolo11s-pose':
+            annotated_frame = process_pose_frame(frame)
+        else:
+            annotated_frame = frame  # Placeholder if you add other models
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        # Annotate FPS and size
+        annotated_frame = annotate_fps_and_size(annotated_frame, start_time)
+
+        # Display the frame
+        cv2.namedWindow("Annotated Feed", cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty("Annotated Feed", cv2.WND_PROP_TOPMOST, 1)
+        cv2.imshow("Annotated Feed", annotated_frame)
+
+        # Listen for keys to change models or quit
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('1'):
+            load_model('yolo11s')  # Load detection model
+        elif key == ord('2'):
+            load_model('yolo11s-pose')  # Load pose model
+        elif key == ord('q'):
             break
 
 except KeyboardInterrupt:
-    print('Keyboard interrupted!')
+    print("Process interrupted.")
 finally:
     vid.release()
     cv2.destroyAllWindows()
