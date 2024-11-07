@@ -9,7 +9,7 @@ from enum import Enum
 
 # Configurations and Constants
 class Config:
-    MQTT_BROKER = "10.243.82.33"  # Replace with actual broker IP
+    MQTT_BROKER = "10.0.0.25"  # Replace with actual broker IP
     STATUS_TOPIC = "bot/state"
     SENSORS_TOPIC = "bot/sensors"
     CONTROL_TOPIC = "bot/motors"
@@ -18,9 +18,6 @@ class Config:
     SAFE_ZONE_RADIUS = 5  # Safe zone radius around target center (pixels)
     STOP_DISTANCE_THRESHOLD = 50  # Distance threshold for stopping (cm)
     TARGET_FPS = 10  # Target FPS for frame processing
-
-# Global configuration for consistent image size
-TARGET_IMAGE_WIDTH = 640  # Set the target width for all frames
 
 # Enum for states
 class State(Enum):
@@ -94,8 +91,8 @@ class VisionSystem:
         logger.info(f"Model '{model_name}' loaded successfully.")
 
     def process_detection_frame(self, frame):
-        target_height = int(TARGET_IMAGE_WIDTH * frame.shape[0] / frame.shape[1])
-        resized_frame = cv2.resize(frame, (TARGET_IMAGE_WIDTH, target_height))
+        target_width, target_height = 640, int(640 * frame.shape[0] / frame.shape[1])
+        resized_frame = cv2.resize(frame, (target_width, target_height))
         resized_frame = cv2.flip(resized_frame, 1)
         results = self.current_model(resized_frame, conf=0.6, verbose=False)
         filtered_boxes = [box for box in results[0].boxes if box.cls in [self.PERSON_ID, self.second_object_id]]
@@ -103,8 +100,8 @@ class VisionSystem:
         return results[0].plot()
 
     def process_pose_frame(self, frame):
-        target_height = int(TARGET_IMAGE_WIDTH * frame.shape[0] / frame.shape[1])
-        resized_frame = cv2.resize(frame, (TARGET_IMAGE_WIDTH, target_height))
+        target_width, target_height = 640, int(640 * frame.shape[0] / frame.shape[1])
+        resized_frame = cv2.resize(frame, (target_width, target_height))
         resized_frame = cv2.flip(resized_frame, 1)
         results = self.current_model(resized_frame, conf=0.6, verbose=False)
         return results[0].plot()
@@ -129,14 +126,10 @@ class RobotStateMachine:
             State.DELIVERY: self._delivery
         }
 
-    def transition_to_state(self, payload):
-        try:
-            new_state = State(payload["state"])
-            logger.info(f"Transitioning to state: {new_state.name}")
-            self.current_state = new_state
-            self.printed_states.clear()
-        except ValueError:
-            logger.error(f"Invalid state received: {payload['state']}")
+    def transition_to_state(self, state):
+        logger.info(f"Transitioning to state: {state.name}")
+        self.current_state = state
+        self.printed_states.clear()
 
     def execute_current_state(self, frame):
         return self.state_actions.get(self.current_state, lambda frame: frame)(frame)
@@ -145,13 +138,13 @@ class RobotStateMachine:
         if State.BOOT_UP not in self.printed_states:
             logger.info("Boot-up: Initializing system and checking connections.")
             self.printed_states.add(State.BOOT_UP)
-        return frame
+        return annotate_frame(frame, "Boot-up")
 
     def _await_activation(self, frame):
         if State.AWAIT_ACTIVATION not in self.printed_states:
             logger.info("Awaiting activation: Monitoring IMU for device tap.")
             self.printed_states.add(State.AWAIT_ACTIVATION)
-        return frame
+        return annotate_frame(frame, "Awaiting Activation")
 
     def _detect_pickup_location(self, frame):
         if State.DETECT_PICKUP_LOCATION not in self.printed_states:
@@ -174,7 +167,7 @@ class RobotStateMachine:
             logger.info("Procurement: Awaiting package placement.")
             self.printed_states.add(State.PROCUREMENT)
         self.motor_control.stop()
-        return frame
+        return annotate_frame(frame, "Procurement")
 
     def _detect_delivery_location(self, frame):
         if State.DETECT_DELIVERY_LOCATION not in self.printed_states:
@@ -197,7 +190,7 @@ class RobotStateMachine:
             logger.info("Delivery: Awaiting package removal.")
             self.printed_states.add(State.DELIVERY)
         self.motor_control.stop()
-        return frame
+        return annotate_frame(frame, "Delivery")
 
     def _navigate_to_target(self, frame):
         results = self.vision_system.current_model(frame, conf=0.6, verbose=False)
@@ -228,13 +221,8 @@ class RobotStateMachine:
             self.motor_control.stop()
 
 # Additional Functions
-def annotate_frame(frame, state_text=None, fps_text=None):
-    if state_text:
-        cv2.putText(frame, state_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-    if fps_text:
-        text_size, _ = cv2.getTextSize(fps_text, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)
-        text_x = frame.shape[1] - text_size[0] - 10
-        cv2.putText(frame, fps_text, (text_x, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+def annotate_frame(frame, text):
+    cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
     return frame
 
 def get_lidar_distance():
@@ -274,10 +262,6 @@ def main():
 
     previous_time = time.time()
 
-    # Set up the window and keep it always on top
-    cv2.namedWindow("Robot Interface", cv2.WINDOW_NORMAL)
-    cv2.setWindowProperty("Robot Interface", cv2.WND_PROP_TOPMOST, 1)
-
     while True:
         ret, frame = vid.read()
         if not ret:
@@ -287,17 +271,8 @@ def main():
         fps = 1 / (current_time - previous_time)
         previous_time = current_time
 
-        # Consistently resize frame to TARGET_IMAGE_WIDTH
-        target_height = int(TARGET_IMAGE_WIDTH * frame.shape[0] / frame.shape[1])
-        frame = cv2.resize(frame, (TARGET_IMAGE_WIDTH, target_height))
-
-        # Get state text and frame rate text
-        state_text = state_machine.current_state.name
-        fps_text = f"FPS: {int(fps)}"
-
-        # Execute the current state and annotate frame with both state and FPS
+        frame = annotate_frame(frame, f"FPS: {int(fps)}")
         frame = state_machine.execute_current_state(frame)
-        frame = annotate_frame(frame, state_text=state_text, fps_text=fps_text)
 
         cv2.imshow("Robot Interface", frame)
 
