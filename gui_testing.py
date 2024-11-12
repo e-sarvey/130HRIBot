@@ -6,7 +6,7 @@ import dearpygui.dearpygui as dpg
 import paho.mqtt.client as mqtt
 
 # MQTT Configurations
-MQTT_BROKER = "10.243.82.33" #"10.0.0.25"  # Example IP
+MQTT_BROKER = "10.0.0.25"  #"10.243.82.33" ## Example IP
 STATUS_TOPIC = "bot/state"
 SENSORS_TOPIC = "bot/sensors"
 CONTROL_TOPIC = "bot/motors"

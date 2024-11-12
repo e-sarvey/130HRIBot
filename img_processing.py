@@ -9,7 +9,7 @@ from enum import Enum
 
 # Configurations and Constants
 class Config:
-    MQTT_BROKER = "10.243.82.33"  # Replace with actual broker IP
+    MQTT_BROKER = "10.0.0.25" #"10.243.82.33"  # Replace with actual broker IP
     STATUS_TOPIC = "bot/state"
     SENSORS_TOPIC = "bot/sensors"
     CONTROL_TOPIC = "bot/motors"
@@ -81,7 +81,7 @@ class VisionSystem:
         self.current_model = None
         self.current_model_name = ""
         self.PERSON_ID = object_classes['person']
-        self.second_object_name = 'bottle'
+        self.second_object_name = 'cup'
         self.second_object_id = object_classes.get(self.second_object_name)
 
     def load_model(self, model_name):
