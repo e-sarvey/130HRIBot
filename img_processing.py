@@ -1,122 +1,122 @@
+from enum import Enum
 import cv2
 import json
 import time
-import random
 import logging
 from ultralytics import YOLO
 import paho.mqtt.client as mqtt
-from enum import Enum
 
 # Configurations and Constants
 class Config:
-    MQTT_BROKER = "10.0.0.25" #"10.243.82.33"  # Replace with actual broker IP
+    MQTT_BROKER = "10.243.82.33"  # Replace with actual broker IP
     STATUS_TOPIC = "bot/state"
     SENSORS_TOPIC = "bot/sensors"
     CONTROL_TOPIC = "bot/motors"
-    Kp = 0.1  # Proportional gain
-    Kd = 0.05  # Derivative gain
-    SAFE_ZONE_RADIUS = 5  # Safe zone radius around target center (pixels)
-    STOP_DISTANCE_THRESHOLD = 50  # Distance threshold for stopping (cm)
+    Kp = 0.5  # Proportional gain
+    Kd = 0.0  # Derivative gain
+    TARGET_IMAGE_WIDTH = 640  # Consistent image width
+    SAFE_ZONE_RADIUS = 5  # Safe zone radius in pixels
     TARGET_FPS = 10  # Target FPS for frame processing
-
-# Global configuration for consistent image size
-TARGET_IMAGE_WIDTH = 640  # Set the target width for all frames
-
-# Enum for states
-class State(Enum):
-    BOOT_UP = 0
-    AWAIT_ACTIVATION = 1
-    DETECT_PICKUP_LOCATION = 2
-    RETRIEVAL = 3
-    PROCUREMENT = 4
-    DETECT_DELIVERY_LOCATION = 5
-    SHIPPING = 6
-    DELIVERY = 7
+    MAX_LEFT_SPEED = 200
+    MAX_RIGHT_SPEED = 200
+    MIN_LEFT_PWM = 50  # Minimum PWM value for left motor
+    MIN_RIGHT_PWM = 50  # Minimum PWM value for right motor
+    STOP_DISTANCE_THRESHOLD = 50  # Lidar distance threshold (cm)
+    DETECTION_TIMEOUT = 45  # Timeout for detecting a target (seconds)
+    NAVIGATION_TIMEOUT = 3  # Timeout for losing a target during navigation (seconds)
 
 # Logger setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Dictionary of detectable objects, reversed for name-to-ID mapping
-object_classes = {
-    'person': 0, 'bicycle': 1, 'car': 2, 'motorcycle': 3, 'airplane': 4, 'bus': 5, 'train': 6, 'truck': 7,
-    'boat': 8, 'traffic light': 9, 'fire hydrant': 10, 'stop sign': 11, 'parking meter': 12, 'bench': 13,
-    'bird': 14, 'cat': 15, 'dog': 16, 'horse': 17, 'sheep': 18, 'cow': 19, 'elephant': 20, 'bear': 21,
-    'zebra': 22, 'giraffe': 23, 'backpack': 24, 'umbrella': 25, 'handbag': 26, 'tie': 27, 'suitcase': 28,
-    'frisbee': 29, 'skis': 30, 'snowboard': 31, 'sports ball': 32, 'kite': 33, 'baseball bat': 34,
-    'baseball glove': 35, 'skateboard': 36, 'surfboard': 37, 'tennis racket': 38, 'bottle': 39, 'wine glass': 40,
-    'cup': 41, 'fork': 42, 'knife': 43, 'spoon': 44, 'bowl': 45, 'banana': 46, 'apple': 47, 'sandwich': 48,
-    'orange': 49, 'broccoli': 50, 'carrot': 51, 'hot dog': 52, 'pizza': 53, 'donut': 54, 'cake': 55,
-    'chair': 56, 'couch': 57, 'potted plant': 58, 'bed': 59, 'dining table': 60, 'toilet': 61, 'tv': 62,
-    'laptop': 63, 'mouse': 64, 'remote': 65, 'keyboard': 66, 'cell phone': 67, 'microwave': 68, 'oven': 69,
-    'toaster': 70, 'sink': 71, 'refrigerator': 72, 'book': 73, 'clock': 74, 'vase': 75, 'scissors': 76,
-    'teddy bear': 77, 'hair drier': 78, 'toothbrush': 79
-}
+# State Enum
+class State(Enum):
+    BOOT_UP = "boot_up"
+    AWAIT_ACTIVATION = "await_activation"
+    DETECT_PICKUP_LOCATION = "detect_pickup_location"
+    RETRIEVAL = "retrieval"
+    PROCUREMENT = "procurement"
+    DETECT_DELIVERY_LOCATION = "detect_delivery_location"
+    SHIPPING = "shipping"
+    DELIVERY = "delivery"
 
 # Motor Control Class
 class MotorControl:
     def __init__(self, mqtt_client, control_topic):
         self.client = mqtt_client
         self.control_topic = control_topic
+        self.previous_error = 0
 
     def _publish_command(self, pwm_values):
         payload = json.dumps({"pwm": pwm_values})
         self.client.publish(self.control_topic, payload)
         logger.info(f"Published motor command: {payload}")
 
-    def spin(self, dir="left", speed=100):
-        left_pwm = -speed if dir == "left" else speed
-        right_pwm = speed if dir == "left" else -speed
+    def move(self, left_pwm, right_pwm):
+        # Ensure minimum PWM thresholds are respected
+        left_pwm = self._apply_min_pwm(left_pwm, Config.MIN_LEFT_PWM)
+        right_pwm = self._apply_min_pwm(right_pwm, Config.MIN_RIGHT_PWM)
+
+        # Saturate motor speeds to the maximum limits
+        left_pwm = max(-Config.MAX_LEFT_SPEED, min(Config.MAX_LEFT_SPEED, left_pwm))
+        right_pwm = max(-Config.MAX_RIGHT_SPEED, min(Config.MAX_RIGHT_SPEED, right_pwm))
+
         self._publish_command([left_pwm, right_pwm])
 
     def stop(self):
         self._publish_command([0, 0])
 
-    def move(self, left_pwm, right_pwm):
-        self._publish_command([left_pwm, right_pwm])
+    def _apply_min_pwm(self, pwm, min_pwm):
+        """Ensure the PWM value respects the minimum threshold for movement."""
+        if pwm > 0:  # Moving forward
+            return max(pwm, min_pwm)
+        elif pwm < 0:  # Moving backward
+            return min(pwm, -min_pwm)
+        return 0  # No movement
 
 # Vision System Class
 class VisionSystem:
     def __init__(self):
         self.current_model = None
         self.current_model_name = ""
-        self.PERSON_ID = object_classes['person']
-        self.second_object_name = 'cup'
-        self.second_object_id = object_classes.get(self.second_object_name)
+        self.PERSON_ID = 0  # Assuming detection of 'person'
+        self.object_id = 41  # Secondary object (e.g., 'cup')
 
     def load_model(self, model_name):
-        if self.current_model_name == model_name:
-            logger.info(f"Model '{model_name}' is already loaded.")
-            return
-        model_path = f"yolo_models/{model_name}.pt"
-        self.current_model = YOLO(model_path, verbose=False)
-        self.current_model_name = model_name
-        logger.info(f"Model '{model_name}' loaded successfully.")
+        if self.current_model_name != model_name:
+            model_path = f"yolo_models/{model_name}.pt"
+            self.current_model = YOLO(model_path, verbose=False)
+            self.current_model_name = model_name
+            logger.info(f"Model '{model_name}' loaded successfully.")
 
-    def process_detection_frame(self, frame):
-        target_height = int(TARGET_IMAGE_WIDTH * frame.shape[0] / frame.shape[1])
-        resized_frame = cv2.resize(frame, (TARGET_IMAGE_WIDTH, target_height))
-        resized_frame = cv2.flip(resized_frame, 1)
+    def process_detection_frame(self, frame, detect_cup=False):
+        target_height = int(Config.TARGET_IMAGE_WIDTH * frame.shape[0] / frame.shape[1])
+        resized_frame = cv2.resize(frame, (Config.TARGET_IMAGE_WIDTH, target_height))
         results = self.current_model(resized_frame, conf=0.6, verbose=False)
-        filtered_boxes = [box for box in results[0].boxes if box.cls in [self.PERSON_ID, self.second_object_id]]
-        results[0].boxes = filtered_boxes
-        return results[0].plot()
 
-    def process_pose_frame(self, frame):
-        target_height = int(TARGET_IMAGE_WIDTH * frame.shape[0] / frame.shape[1])
-        resized_frame = cv2.resize(frame, (TARGET_IMAGE_WIDTH, target_height))
-        resized_frame = cv2.flip(resized_frame, 1)
-        results = self.current_model(resized_frame, conf=0.6, verbose=False)
-        return results[0].plot()
+        # Filter for person and optional secondary object
+        valid_classes = [self.PERSON_ID]
+        if detect_cup and self.object_id is not None:
+            valid_classes.append(self.object_id)
+
+        filtered_boxes = [box for box in results[0].boxes if box.cls in valid_classes]
+
+        # Select the largest target box
+        target_box = None
+        if filtered_boxes:
+            target_box = max(filtered_boxes, key=lambda box: (box.xyxy[0][2] - box.xyxy[0][0]) * (box.xyxy[0][3] - box.xyxy[0][1]))
+
+        return results[0].plot(), target_box
 
 # Robot State Machine
 class RobotStateMachine:
-    def __init__(self, motor_control, vision_system):
+    def __init__(self, motor_control, vision_system, mqtt_client):
         self.current_state = State.BOOT_UP
         self.motor_control = motor_control
         self.vision_system = vision_system
-        self.previous_error = 0
         self.printed_states = set()
+        self.state_start_time = None  # Track when the state started
+        self.mqtt_client = mqtt_client
 
         self.state_actions = {
             State.BOOT_UP: self._boot_up,
@@ -129,182 +129,187 @@ class RobotStateMachine:
             State.DELIVERY: self._delivery
         }
 
-    def transition_to_state(self, payload):
-        try:
-            new_state = State(payload["state"])
-            logger.info(f"Transitioning to state: {new_state.name}")
-            self.current_state = new_state
-            self.printed_states.clear()
-        except ValueError:
-            logger.error(f"Invalid state received: {payload['state']}")
+    def handle_event(self, event):
+        if self.current_state == State.AWAIT_ACTIVATION and event == "imu_tap_detected":
+            self.transition_to_state(State.DETECT_PICKUP_LOCATION)
+        elif self.current_state == State.RETRIEVAL and event == "lidar_threshold_met":
+            self.transition_to_state(State.PROCUREMENT)
+        elif self.current_state == State.SHIPPING and event == "lidar_threshold_met":
+            self.transition_to_state(State.DELIVERY)
+        elif self.current_state == State.PROCUREMENT and event == "cup_placed":
+            self.transition_to_state(State.DETECT_DELIVERY_LOCATION)
+        elif self.current_state == State.DELIVERY and event == "cup_removed":
+            self.transition_to_state(State.AWAIT_ACTIVATION)
+
+    def transition_to_state(self, next_state):
+        logger.info(f"Transitioning to state: {next_state.name}")
+        self.mqtt_client.publish(Config.STATUS_TOPIC, json.dumps({"state": f"start_{next_state.value}"}))
+        self.current_state = next_state
+        self.state_start_time = time.time()
+        self.printed_states.clear()
 
     def execute_current_state(self, frame):
-        return self.state_actions.get(self.current_state, lambda frame: frame)(frame)
+        if self.current_state in self.state_actions:
+            return self.state_actions[self.current_state](frame)
+        return frame
 
     def _boot_up(self, frame):
         if State.BOOT_UP not in self.printed_states:
-            logger.info("Boot-up: Initializing system and checking connections.")
+            logger.info("Booting up...")
             self.printed_states.add(State.BOOT_UP)
+            self.transition_to_state(State.AWAIT_ACTIVATION)
         return frame
 
     def _await_activation(self, frame):
         if State.AWAIT_ACTIVATION not in self.printed_states:
-            logger.info("Awaiting activation: Monitoring IMU for device tap.")
+            logger.info("Awaiting activation...")
             self.printed_states.add(State.AWAIT_ACTIVATION)
         return frame
 
     def _detect_pickup_location(self, frame):
         if State.DETECT_PICKUP_LOCATION not in self.printed_states:
-            logger.info("Detecting pickup location: Scanning for person and object.")
+            logger.info("Detecting pickup location: Slowly turning left.")
             self.printed_states.add(State.DETECT_PICKUP_LOCATION)
-        self.vision_system.load_model('yolo11s')
-        self.motor_control.spin(dir="left", speed=100)
-        return self.vision_system.process_detection_frame(frame)
+            self.motor_control.move(-70, 70)  # Slow turn left
+
+        processed_frame, target_box = self.vision_system.process_detection_frame(frame, detect_cup=True)
+        if target_box:
+            logger.info("Person and cup detected in pickup location.")
+            self.motor_control.stop()
+            self.transition_to_state(State.RETRIEVAL)
+        elif time.time() - self.state_start_time > Config.DETECTION_TIMEOUT:
+            logger.warning("Timeout in pickup location. Returning to await activation.")
+            self.transition_to_state(State.AWAIT_ACTIVATION)
+        return processed_frame
+
 
     def _retrieval(self, frame):
         if State.RETRIEVAL not in self.printed_states:
-            logger.info("Retrieval: Navigating to target using PD control.")
+            logger.info("Retrieval: Navigating to target.")
             self.printed_states.add(State.RETRIEVAL)
-        self.vision_system.load_model('yolo11s')
-        self._navigate_to_target(frame)
-        return frame
+
+        processed_frame, target_box = self.vision_system.process_detection_frame(frame)
+        if target_box:
+            # PD control logic to navigate to the target
+            box_center_x = int((target_box.xyxy[0][0] + target_box.xyxy[0][2]) / 2)
+            img_center_x = Config.TARGET_IMAGE_WIDTH // 2
+            error = box_center_x - img_center_x
+
+            derivative = error - self.motor_control.previous_error
+            adjustment = Config.Kp * error + Config.Kd * derivative
+            self.motor_control.previous_error = error
+
+            left_pwm = 100 - adjustment
+            right_pwm = 100 + adjustment
+            self.motor_control.move(int(left_pwm), int(right_pwm))
+        else:
+            logger.warning("Target lost in retrieval.")
+            if time.time() - self.state_start_time > 4:  # 4-second timeout for lost target
+                logger.warning("Target lost timeout. Returning to detect pickup location.")
+                self.transition_to_state(State.DETECT_PICKUP_LOCATION)
+
+        return processed_frame
 
     def _procurement(self, frame):
         if State.PROCUREMENT not in self.printed_states:
-            logger.info("Procurement: Awaiting package placement.")
+            logger.info("Procurement: Waiting for cup placement.")
             self.printed_states.add(State.PROCUREMENT)
-        self.motor_control.stop()
+            self.motor_control.stop()
         return frame
 
     def _detect_delivery_location(self, frame):
         if State.DETECT_DELIVERY_LOCATION not in self.printed_states:
-            logger.info("Detecting delivery location: Scanning for delivery point.")
+            logger.info("Detecting delivery location: Slowly turning left.")
             self.printed_states.add(State.DETECT_DELIVERY_LOCATION)
-        self.vision_system.load_model('yolo11s-pose')
-        self.motor_control.spin(dir="right", speed=100)
-        return self.vision_system.process_detection_frame(frame)
+            self.motor_control.move(-70, 70)  # Slow turn left
+
+        processed_frame, target_box = self.vision_system.process_detection_frame(frame)
+        if target_box:
+            logger.info("Person detected in delivery location.")
+            self.motor_control.stop()
+            self.transition_to_state(State.SHIPPING)
+        elif time.time() - self.state_start_time > Config.DETECTION_TIMEOUT:
+            logger.warning("Timeout in delivery location. Returning to await activation.")
+            self.transition_to_state(State.AWAIT_ACTIVATION)
+        return processed_frame
 
     def _shipping(self, frame):
         if State.SHIPPING not in self.printed_states:
             logger.info("Shipping: Navigating to delivery point.")
             self.printed_states.add(State.SHIPPING)
-        self.vision_system.load_model('yolo11s-pose')
-        self._navigate_to_target(frame)
-        return frame
+
+        processed_frame, target_box = self.vision_system.process_detection_frame(frame)
+        if target_box:
+            # PD control logic to navigate to the target
+            box_center_x = int((target_box.xyxy[0][0] + target_box.xyxy[0][2]) / 2)
+            img_center_x = Config.TARGET_IMAGE_WIDTH // 2
+            error = box_center_x - img_center_x
+
+            derivative = error - self.motor_control.previous_error
+            adjustment = Config.Kp * error + Config.Kd * derivative
+            self.motor_control.previous_error = error
+
+            left_pwm = 100 - adjustment
+            right_pwm = 100 + adjustment
+            self.motor_control.move(int(left_pwm), int(right_pwm))
+        else:
+            logger.warning("Target lost in shipping.")
+            if time.time() - self.state_start_time > 4:  # 4-second timeout for lost target
+                logger.warning("Target lost timeout. Returning to detect delivery location.")
+                self.transition_to_state(State.DETECT_DELIVERY_LOCATION)
+
+        return processed_frame
 
     def _delivery(self, frame):
         if State.DELIVERY not in self.printed_states:
-            logger.info("Delivery: Awaiting package removal.")
+            logger.info("Delivery: Waiting for cup removal.")
             self.printed_states.add(State.DELIVERY)
-        self.motor_control.stop()
+            self.motor_control.stop()
         return frame
-
-    def _navigate_to_target(self, frame):
-        results = self.vision_system.current_model(frame, conf=0.6, verbose=False)
-        target_found = False
-        for box in results[0].boxes:
-            if box.cls == self.vision_system.PERSON_ID or box.cls == self.vision_system.second_object_id:
-                x_min, x_max = map(int, box.xyxy[0][0:2])
-                target_center_x = (x_min + x_max) // 2
-                frame_center_x = frame.shape[1] // 2
-                error = target_center_x - frame_center_x
-                target_found = True
-                break
-
-        if target_found:
-            error_derivative = error - self.previous_error
-            control_signal = Config.Kp * error + Config.Kd * error_derivative
-            self.previous_error = error
-            base_speed = 150
-            left_pwm = base_speed + control_signal
-            right_pwm = base_speed - control_signal
-            left_pwm = max(min(int(left_pwm), 255), -255)
-            right_pwm = max(min(int(right_pwm), 255), -255)
-            self.motor_control.move(left_pwm, right_pwm)
-        else:
-            self.motor_control.stop()
-
-        if get_lidar_distance() <= Config.STOP_DISTANCE_THRESHOLD:
-            self.motor_control.stop()
-
-# Additional Functions
-def annotate_frame(frame, state_text=None, fps_text=None):
-    if state_text:
-        cv2.putText(frame, state_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-    if fps_text:
-        text_size, _ = cv2.getTextSize(fps_text, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)
-        text_x = frame.shape[1] - text_size[0] - 10
-        cv2.putText(frame, fps_text, (text_x, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-    return frame
-
-def get_lidar_distance():
-    return random.randint(30, 100)
 
 # MQTT Handler
 class MQTTHandler:
-    def __init__(self, broker, state_callback, sensor_callback):
+    def __init__(self, broker, state_machine):
         self.client = mqtt.Client()
         self.client.on_connect = self._on_connect
         self.client.on_message = self._on_message
-        self.state_callback = state_callback
-        self.sensor_callback = sensor_callback
+        self.state_machine = state_machine
         self.client.connect(broker)
         self.client.loop_start()
 
     def _on_connect(self, client, userdata, flags, rc):
         logger.info("Connected to MQTT broker.")
-        self.client.subscribe([(Config.STATUS_TOPIC, 0), (Config.SENSORS_TOPIC, 0)])
+        self.client.subscribe(Config.STATUS_TOPIC)
 
     def _on_message(self, client, userdata, msg):
         payload = json.loads(msg.payload.decode())
-        if msg.topic == Config.STATUS_TOPIC:
-            self.state_callback(payload)
-        elif msg.topic == Config.SENSORS_TOPIC:
-            self.sensor_callback(payload)
+        if "event" in payload:
+            self.state_machine.handle_event(payload["event"])
+        elif "state" in payload:
+            logger.info(f"State change acknowledged: {payload['state']}")
 
-# Main loop for video and state handling
+# Main loop
 def main():
     vid = cv2.VideoCapture(0)
-    vision_system = VisionSystem()
     mqtt_client = mqtt.Client()
     mqtt_client.connect(Config.MQTT_BROKER)
     motor_control = MotorControl(mqtt_client, Config.CONTROL_TOPIC)
-    state_machine = RobotStateMachine(motor_control, vision_system)
-    mqtt_handler = MQTTHandler(Config.MQTT_BROKER, state_machine.transition_to_state, lambda payload: logger.info("Sensor data received"))
+    vision_system = VisionSystem()
 
-    previous_time = time.time()
-
-    # Set up the window and keep it always on top
-    cv2.namedWindow("Robot Interface", cv2.WINDOW_NORMAL)
-    cv2.setWindowProperty("Robot Interface", cv2.WND_PROP_TOPMOST, 1)
+    state_machine = RobotStateMachine(motor_control, vision_system, mqtt_client)
+    mqtt_handler = MQTTHandler(Config.MQTT_BROKER, state_machine)
 
     while True:
         ret, frame = vid.read()
         if not ret:
             break
 
-        current_time = time.time()
-        fps = 1 / (current_time - previous_time)
-        previous_time = current_time
-
-        # Consistently resize frame to TARGET_IMAGE_WIDTH
-        target_height = int(TARGET_IMAGE_WIDTH * frame.shape[0] / frame.shape[1])
-        frame = cv2.resize(frame, (TARGET_IMAGE_WIDTH, target_height))
-
-        # Get state text and frame rate text
-        state_text = state_machine.current_state.name
-        fps_text = f"FPS: {int(fps)}"
-
-        # Execute the current state and annotate frame with both state and FPS
         frame = state_machine.execute_current_state(frame)
-        frame = annotate_frame(frame, state_text=state_text, fps_text=fps_text)
-
         cv2.imshow("Robot Interface", frame)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-    mqtt_client.loop_stop()
     vid.release()
     cv2.destroyAllWindows()
 
