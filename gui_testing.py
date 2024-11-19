@@ -54,6 +54,7 @@ dpg.create_context()
 with dpg.window(label="State Transition Tester", width=600, height=400):
     dpg.add_text("Simulate Events")
     with dpg.group(horizontal=True):
+        dpg.add_button(label="Robot Initialized", callback=lambda: publish_event("robot_initialized"))
         dpg.add_button(label="IMU Tap", callback=lambda: publish_event("imu_tap_detected"))
         dpg.add_button(label="Lidar Threshold Met", callback=lambda: publish_event("lidar_threshold_met"))
         dpg.add_button(label="Cup Placed", callback=lambda: publish_event("cup_placed"))
