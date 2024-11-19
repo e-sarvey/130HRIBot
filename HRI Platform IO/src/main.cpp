@@ -3,7 +3,6 @@
 #include <Adafruit_SSD1306.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
-#include <ArduinoJson.h>
 #include "Adafruit_VL53L1X.h"
 #include <math.h>
 
@@ -80,20 +79,14 @@ void handleLidar();
 void publishEvent(const char* event);
 
 // ============================ MQTT Callback ============================
-// This function processes incoming MQTT messages
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-    JsonDocument doc = StaticJsonDocument<128>(); // Explicitly specify `StaticJsonDocument`
-    DeserializationError error = deserializeJson(doc, payload, length);
+    char message[length + 1];
+    strncpy(message, (char*)payload, length);
+    message[length] = '\0';
 
-    if (error) {
-        Serial.println("Failed to parse MQTT message.");
-        return;
-    }
-
-    const char* stateCommand = doc["state"];
-    if (stateCommand) {
-        if (String(stateCommand).startsWith("start_")) {
-            String newState = String(stateCommand).substring(6);
+    if (String(topic) == stateTopic) {
+        if (String(message).startsWith("start_")) {
+            String newState = String(message).substring(6);
             if (newState == "await_activation") currentState = AWAIT_ACTIVATION;
             else if (newState == "detect_pickup_location") currentState = DETECT_PICKUP_LOCATION;
             else if (newState == "retrieval") currentState = RETRIEVAL;
@@ -102,14 +95,16 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
             else if (newState == "shipping") currentState = SHIPPING;
             else if (newState == "delivery") currentState = DELIVERY;
 
+            Serial.print("State changed to: ");
+            Serial.println(newState);
             updateOLED("State Changed:", newState);
-            publishEvent((newState + "_started").c_str());
+            String eventMessage = "{\"state\": \"" + newState + "_started\"}";
+            mqttClient.publish(stateTopic, eventMessage.c_str());
         }
     }
 }
 
 // ============================ Wi-Fi Connection ============================
-// Connects to the specified Wi-Fi network
 void connectToWiFi() {
     Serial.print("Connecting to Wi-Fi...");
     WiFi.begin(ssid, password);
@@ -121,13 +116,13 @@ void connectToWiFi() {
 }
 
 // ============================ MQTT Connection ============================
-// Connects to the MQTT broker and subscribes to necessary topics
 void connectToMQTT() {
     while (!mqttClient.connected()) {
         Serial.print("Connecting to MQTT...");
         if (mqttClient.connect("ESP32Client")) {
             Serial.println(" Connected.");
             mqttClient.subscribe(stateTopic);
+            mqttClient.subscribe(motorTopic);
         } else {
             Serial.println(" Failed. Retrying...");
             delay(5000);
@@ -136,7 +131,6 @@ void connectToMQTT() {
 }
 
 // ============================ OLED Update ============================
-// Updates the OLED display with two lines of text
 void updateOLED(const String& line1, const String& line2) {
     display.clearDisplay();
     display.setTextSize(1);
@@ -149,7 +143,6 @@ void updateOLED(const String& line1, const String& line2) {
 }
 
 // ============================ IMU Tap Detection ============================
-// Detects a tap event using the MPU6050 accelerometer
 bool tapDetected() {
     int16_t ax, ay, az;
     Wire.beginTransmission(MPU);
@@ -161,7 +154,7 @@ bool tapDetected() {
     az = (Wire.read() << 8 | Wire.read());
 
     float accelMagnitude = sqrt(ax * ax + ay * ay + az * az) / 16384.0;
-
+    Serial.println(accelMagnitude);
     if (accelMagnitude > 2.2) {  // Tap threshold
         tapDisplayTime = millis();
         return true;
@@ -170,7 +163,6 @@ bool tapDetected() {
 }
 
 // ============================ Cup Detection ============================
-// Detects if a cup is placed based on the photoresistor reading
 String cupDetected() {
     int sensorValue = analogRead(photoPin);
     float voltage = sensorValue * (3.3 / 4095.0);
@@ -178,31 +170,19 @@ String cupDetected() {
 }
 
 // ============================ Lidar Handling ============================
-// Monitors distance using the Lidar and publishes an event if below threshold
 void handleLidar() {
     if (vl53.dataReady()) {
         int16_t distance = vl53.distance();
         if (distance != -1 && distance < lidarThreshold) {
-            publishEvent("lidar_threshold_met");
+            mqttClient.publish(sensorsTopic, "{\"event\": \"lidar_threshold_met\"}");
+            Serial.println("Event published: lidar_threshold_met");
         }
         vl53.clearInterrupt();
     }
 }
 
-// ============================ Publish Event ============================
-// Publishes an event to the MQTT sensors topic
-void publishEvent(const char* event) {
-    JsonDocument doc = StaticJsonDocument<128>(); // Explicitly specify `StaticJsonDocument`
-    doc["event"] = event;
-    char buffer[128];
-    size_t len = serializeJson(doc, buffer);
-    mqttClient.publish(sensorsTopic, buffer, len);
-}
-
 // ============================ Motor Control ============================
-// Sets motor PWM values
 void setMotors(int pwm1, int pwm2) {
-    // Motor 1
     if (pwm1 > 0) {
         ledcWrite(pwmChannel1Fwd, pwm1);
         ledcWrite(pwmChannel1Rev, 0);
@@ -211,7 +191,6 @@ void setMotors(int pwm1, int pwm2) {
         ledcWrite(pwmChannel1Rev, -pwm1);
     }
 
-    // Motor 2
     if (pwm2 > 0) {
         ledcWrite(pwmChannel2Fwd, pwm2);
         ledcWrite(pwmChannel2Rev, 0);
@@ -221,13 +200,12 @@ void setMotors(int pwm1, int pwm2) {
     }
 }
 
-// Stops both motors
 void stopMotors() {
     setMotors(0, 0);
+    Serial.println("Motors stopped.");
 }
 
 // ============================ Setup ============================
-// Initializes all components and connections
 void setup() {
     Serial.begin(115200);
 
@@ -235,6 +213,7 @@ void setup() {
     connectToWiFi();
     mqttClient.setServer(mqttServer, mqttPort);
     mqttClient.setCallback(mqttCallback);
+    connectToMQTT();
 
     // Initialize OLED
     if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
@@ -251,6 +230,7 @@ void setup() {
     Wire.write(0x6B);  // Power management register
     Wire.write(0x00);  // Wake up MPU6050
     Wire.endTransmission(true);
+    Serial.println("MPU6050 initialized.");
 
     // Initialize Lidar
     if (!vl53.begin(0x29, &Wire)) {
@@ -259,6 +239,7 @@ void setup() {
     }
     vl53.setTimingBudget(50);
     vl53.startRanging();
+    Serial.println("Lidar initialized.");
 
     // Initialize Motor PWM
     ledcSetup(pwmChannel1Fwd, pwmFreq, pwmResolution);
@@ -270,24 +251,23 @@ void setup() {
     ledcSetup(pwmChannel2Rev, pwmFreq, pwmResolution);
     ledcAttachPin(motor2Pin2, pwmChannel2Rev);
 
-    // Publish initialization complete
-    publishEvent("robot_initialized");
-    Serial.println("Setup complete.");
+    mqttClient.publish(sensorsTopic, "{\"event\": \"robot_initialized\"}");
+    delay(1);
+    Serial.println("Setup complete. Event published: robot_initialized");
 }
 
 // ============================ Loop ============================
-// Main program logic
 void loop() {
     if (!mqttClient.connected()) {
         connectToMQTT();
     }
     mqttClient.loop();
 
-    // State-specific behavior
     switch (currentState) {
         case AWAIT_ACTIVATION:
             if (tapDetected()) {
-                publishEvent("imu_tap_detected");
+                mqttClient.publish(sensorsTopic, "{\"event\": \"imu_tap_detected\"}");
+                Serial.println("Event published: imu_tap_detected");
             }
             break;
 
@@ -299,7 +279,11 @@ void loop() {
         case PROCUREMENT:
         case DELIVERY:
             if (cupDetected() == "Cup Detected") {
-                publishEvent(currentState == PROCUREMENT ? "cup_placed" : "cup_removed");
+                const char* event = (currentState == PROCUREMENT) ? "cup_placed" : "cup_removed";
+                String message = "{\"event\": \"" + String(event) + "\"}";
+                mqttClient.publish(sensorsTopic, message.c_str());
+                Serial.print("Event published: ");
+                Serial.println(event);
             }
             break;
 
@@ -307,9 +291,8 @@ void loop() {
             break;
     }
 
-    // Failsafe: Stop motors if no commands for 45 seconds
-    if (millis() - lastMotorCommandTime > FAILSAFE_TIMEOUT) {
-        stopMotors();
-        lastMotorCommandTime = millis();
-    }
+    // if (millis() - lastMotorCommandTime > FAILSAFE_TIMEOUT) {
+    //     stopMotors();
+    //     lastMotorCommandTime = millis();
+    // }
 }

@@ -330,7 +330,7 @@ def main():
         if not ret:
             break
 
-        cv2.setWindowProperty("Robot Interface", cv2.WND_PROP_TOPMOST, 1)
+        #cv2.setWindowProperty("Robot Interface", cv2.WND_PROP_TOPMOST, 1)
 
         frame = state_machine.execute_current_state(frame)
 
