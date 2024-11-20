@@ -3,10 +3,14 @@
 #include <Adafruit_SSD1306.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
-#include "Adafruit_VL53L1X.h"
+#include <Adafruit_VL53L1X.h>
+#include <ArduinoJson.h>
 #include <math.h>
 
 // Wi-Fi and MQTT Settings
+// const char* ssid = "53CurtisAve2";
+// const char* password = "Apt2@53CurtisAve";
+// const char* mqttServer = "10.0.0.25"; //"10.243.82.33";
 const char* ssid = "Tufts_Robot";
 const char* password = "";
 const char* mqttServer = "10.243.82.33";
@@ -73,20 +77,55 @@ void mqttCallback(char* topic, byte* payload, unsigned int length);
 void setMotors(int pwm1, int pwm2);
 void stopMotors();
 void updateOLED(const String& line1, const String& line2);
-bool tapDetected();
-String cupDetected();
+void tapDetected();
+void cupDetected();
 void handleLidar();
 void publishEvent(const char* event);
 
+// ============================ MQTT Callback ============================
 // ============================ MQTT Callback ============================
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
     char message[length + 1];
     strncpy(message, (char*)payload, length);
     message[length] = '\0';
+        // Suppress printing for bot/motors topic
+    if (String(topic) == motorTopic) {
+        return;
+    }
+    // Debug: Log received message
+    // Serial.print("MQTT Message received on topic: ");
+    // Serial.println(topic);
+    // Serial.print("Payload: ");
+    // Serial.println(message);
 
+    // Check if the topic is for state changes
     if (String(topic) == stateTopic) {
-        if (String(message).startsWith("start_")) {
-            String newState = String(message).substring(6);
+        // Parse the JSON message
+        StaticJsonDocument<128> doc; // Adjust size if needed
+        DeserializationError error = deserializeJson(doc, message);
+
+        if (error) {
+            Serial.print("JSON parsing failed: ");
+            Serial.println(error.c_str());
+            return;
+        }
+
+        // Extract the "state" field
+        const char* stateCommand = doc["state"];
+        if (stateCommand == nullptr) {
+            Serial.println("No 'state' field found in JSON message.");
+            return;
+        }
+
+        // Debug: Log the extracted state command
+        Serial.print("Recieved state command: ");
+        Serial.println(stateCommand);
+
+        // Handle state change commands
+        if (String(stateCommand).startsWith("start_")) {
+            String newState = String(stateCommand).substring(6);
+
+            // Validate and update the state
             if (newState == "await_activation") currentState = AWAIT_ACTIVATION;
             else if (newState == "detect_pickup_location") currentState = DETECT_PICKUP_LOCATION;
             else if (newState == "retrieval") currentState = RETRIEVAL;
@@ -94,15 +133,31 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
             else if (newState == "detect_delivery_location") currentState = DETECT_DELIVERY_LOCATION;
             else if (newState == "shipping") currentState = SHIPPING;
             else if (newState == "delivery") currentState = DELIVERY;
+            else {
+                Serial.println("Invalid state received. Ignoring...");
+                return;
+            }
 
-            Serial.print("State changed to: ");
+            // Debug: Confirm state update
+            Serial.print("State successfully updated to: ");
             Serial.println(newState);
-            updateOLED("State Changed:", newState);
-            String eventMessage = "{\"state\": \"" + newState + "_started\"}";
-            mqttClient.publish(stateTopic, eventMessage.c_str());
+
+            // Update OLED display
+            updateOLED("CURRENT STATE", newState);
+
+            // Publish confirmation message
+            String confirmationMessage = "{\"state\": \"" + newState + "_started\"}";
+            mqttClient.publish(stateTopic, confirmationMessage.c_str());
+
+            // Debug: Log confirmation message
+            Serial.print("Confirmation message published: ");
+            Serial.println(confirmationMessage);
+        } else {
+            //Serial.println("State command does not start with 'start_'. Ignoring...");
         }
     }
 }
+
 
 // ============================ Wi-Fi Connection ============================
 void connectToWiFi() {
@@ -143,7 +198,7 @@ void updateOLED(const String& line1, const String& line2) {
 }
 
 // ============================ IMU Tap Detection ============================
-bool tapDetected() {
+void tapDetected() {
     int16_t ax, ay, az;
     Wire.beginTransmission(MPU);
     Wire.write(0x3B);  // Register address for accelerometer data
@@ -154,32 +209,59 @@ bool tapDetected() {
     az = (Wire.read() << 8 | Wire.read());
 
     float accelMagnitude = sqrt(ax * ax + ay * ay + az * az) / 16384.0;
-    Serial.println(accelMagnitude);
+
+    // Log the IMU readings for debugging
+    // Serial.print("Accel Magnitude: "); // Uncomment for debugging
+    // Serial.println(accelMagnitude);
+
+    // Check if the magnitude exceeds the tap threshold
     if (accelMagnitude > 2.2) {  // Tap threshold
-        tapDisplayTime = millis();
-        return true;
+        mqttClient.publish(sensorsTopic, "{\"event\": \"imu_tap_detected\"}");
+        Serial.println("Event published: imu_tap_detected");
     }
-    return false;
 }
 
+
 // ============================ Cup Detection ============================
-String cupDetected() {
+void cupDetected() {
     int sensorValue = analogRead(photoPin);
     float voltage = sensorValue * (3.3 / 4095.0);
-    return voltage < 0.5 ? "Cup Detected" : "Place Cup";
+    // Serial.print("Photoresistor Voltage: ");
+    // Serial.println(voltage);
+
+    // Check the state to determine action
+    if (currentState == PROCUREMENT && voltage < 1.8) {
+        // Cup placed in PROCUREMENT state
+        mqttClient.publish(sensorsTopic, "{\"event\": \"cup_placed\"}");
+        Serial.println("Event published: cup_placed");
+    } else if (currentState == DELIVERY && voltage > 1.8) {
+        // Cup removed in DELIVERY state
+        mqttClient.publish(sensorsTopic, "{\"event\": \"cup_removed\"}");
+        Serial.println("Event published: cup_removed");
+    }
 }
 
 // ============================ Lidar Handling ============================
 void handleLidar() {
-    if (vl53.dataReady()) {
-        int16_t distance = vl53.distance();
-        if (distance != -1 && distance < lidarThreshold) {
-            mqttClient.publish(sensorsTopic, "{\"event\": \"lidar_threshold_met\"}");
-            Serial.println("Event published: lidar_threshold_met");
+    // Only use Lidar in RETRIEVAL and SHIPPING states
+    if (currentState == RETRIEVAL || currentState == SHIPPING) {
+        if (vl53.dataReady()) {
+            int16_t distance = vl53.distance();
+            // Serial.print("Lidar Distance: ");
+            // Serial.println(distance);
+
+            if (distance != -1 && distance < lidarThreshold) {
+                mqttClient.publish(sensorsTopic, "{\"event\": \"lidar_threshold_met\"}");
+                Serial.println("Event published: lidar_threshold_met");
+            }
+            vl53.clearInterrupt();
         }
-        vl53.clearInterrupt();
+    } else {
+        // Avoid unnecessary Lidar readings
+        //Serial.println("Lidar ignored in current state.");
     }
 }
+
 
 // ============================ Motor Control ============================
 void setMotors(int pwm1, int pwm2) {
@@ -220,8 +302,16 @@ void setup() {
         Serial.println(F("OLED initialization failed"));
         while (true);
     }
+    // This process clears and displays
     display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.setTextSize(1);
+    display.print("Welcome!");
     display.display();
+    Serial.println("OLED Initialized");
+    delay(2);
+    updateOLED("CURRENT STATE:", "BOOT-UP");
 
     // Initialize MPU6050
     Wire.begin();
@@ -265,34 +355,30 @@ void loop() {
 
     switch (currentState) {
         case AWAIT_ACTIVATION:
-            if (tapDetected()) {
-                mqttClient.publish(sensorsTopic, "{\"event\": \"imu_tap_detected\"}");
-                Serial.println("Event published: imu_tap_detected");
-            }
+            tapDetected();
             break;
 
         case DETECT_PICKUP_LOCATION:
-        case DETECT_DELIVERY_LOCATION:
+            break;
+
+        case RETRIEVAL:
             handleLidar();
             break;
 
         case PROCUREMENT:
+            cupDetected();
+            break;
+
+        case SHIPPING:
+            handleLidar();
+            break;
+
         case DELIVERY:
-            if (cupDetected() == "Cup Detected") {
-                const char* event = (currentState == PROCUREMENT) ? "cup_placed" : "cup_removed";
-                String message = "{\"event\": \"" + String(event) + "\"}";
-                mqttClient.publish(sensorsTopic, message.c_str());
-                Serial.print("Event published: ");
-                Serial.println(event);
-            }
+            cupDetected();
             break;
 
         default:
             break;
     }
-
-    // if (millis() - lastMotorCommandTime > FAILSAFE_TIMEOUT) {
-    //     stopMotors();
-    //     lastMotorCommandTime = millis();
-    // }
 }
+

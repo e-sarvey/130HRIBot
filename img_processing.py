@@ -8,6 +8,7 @@ import paho.mqtt.client as mqtt
 
 # Configurations and Constants
 class Config:
+    # MQTT_BROKER = "10.0.0.25"
     MQTT_BROKER = "10.243.82.33"  # Replace with actual broker IP
     STATUS_TOPIC = "bot/state"
     SENSORS_TOPIC = "bot/sensors"
@@ -137,13 +138,16 @@ class RobotStateMachine:
             State.SHIPPING: self._shipping,
             State.DELIVERY: self._delivery
         }
-
     def handle_event(self, event):
         logger.info(f"Received event: {event}, Current state: {self.current_state}")
         if self.current_state == State.BOOT_UP and event == "robot_initialized":
             self.transition_to_state(State.AWAIT_ACTIVATION)
         elif self.current_state == State.AWAIT_ACTIVATION and event == "imu_tap_detected":
             self.transition_to_state(State.DETECT_PICKUP_LOCATION)
+        elif self.current_state == State.DETECT_PICKUP_LOCATION and event == "person_detected":
+            logger.info("Person detected. Stopping motors and transitioning to retrieval.")
+            self.motor_control.stop()
+            self.transition_to_state(State.RETRIEVAL)
         elif self.current_state == State.RETRIEVAL and event == "lidar_threshold_met":
             self.transition_to_state(State.PROCUREMENT)
         elif self.current_state == State.SHIPPING and event == "lidar_threshold_met":
@@ -179,7 +183,7 @@ class RobotStateMachine:
             logger.info("Awaiting activation...")
             self.printed_states.add(State.AWAIT_ACTIVATION)
         return frame
-
+    
     def _detect_pickup_location(self, frame):
         if State.DETECT_PICKUP_LOCATION not in self.printed_states:
             logger.info("Detecting pickup location: Slowly turning left.")
@@ -190,7 +194,8 @@ class RobotStateMachine:
         if target_box:
             logger.info("Person and cup detected in pickup location.")
             self.motor_control.stop()
-            self.transition_to_state(State.RETRIEVAL)
+            self.mqtt_client.publish(Config.SENSORS_TOPIC, json.dumps({"event": "person_detected"}))
+            logger.info("Event published: person_detected")
         elif time.time() - self.state_start_time > Config.DETECTION_TIMEOUT:
             logger.warning("Timeout in pickup location. Returning to await activation.")
             self.transition_to_state(State.AWAIT_ACTIVATION)
@@ -290,15 +295,27 @@ class MQTTHandler:
 
     def _on_connect(self, client, userdata, flags, rc):
         logger.info("Connected to MQTT broker.")
+        # Subscribe to necessary topics
         self.client.subscribe([(Config.STATUS_TOPIC, 0), (Config.SENSORS_TOPIC, 0)])
 
     def _on_message(self, client, userdata, msg):
         payload = json.loads(msg.payload.decode())
         logger.info(f"Message received on topic {msg.topic}: {payload}")
+
+        # Handle events or commands based on the topic
         if "event" in payload:
+            # Handle event messages from the ESP
             self.state_machine.handle_event(payload["event"])
         elif "state" in payload:
-            logger.info(f"State change acknowledged: {payload['state']}")
+            state_value = payload["state"]
+            # Ignore confirmation messages (ending with "_started")
+            if state_value.endswith("_started"):
+                logger.info(f"State confirmation received: {state_value}")
+                return
+            # Handle new state commands
+            logger.info(f"State change command received: {state_value}")
+            self.state_machine.handle_event(state_value)
+
 
 # Annotate Frame Function
 def annotate_frame(frame, state_text=None, fps_text=None):
