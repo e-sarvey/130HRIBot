@@ -5,6 +5,7 @@ import paho.mqtt.client as mqtt
 
 # MQTT Configurations
 MQTT_BROKER = "10.243.82.33"
+# MQTT_BROKER = "10.0.0.25"
 STATUS_TOPIC = "bot/state"
 SENSORS_TOPIC = "bot/sensors"
 CONTROL_TOPIC = "bot/motors"
