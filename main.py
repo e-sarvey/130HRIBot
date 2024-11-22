@@ -1,3 +1,5 @@
+# Updated Robot State Machine with Dynamic Object Detection and Navigation
+
 from enum import Enum
 import cv2
 import json
@@ -5,26 +7,34 @@ import time
 import logging
 from ultralytics import YOLO
 import paho.mqtt.client as mqtt
+from classes import object_index_json
 
 # Configurations and Constants
 class Config:
-    # MQTT_BROKER = "10.0.0.25"
     MQTT_BROKER = "10.243.82.33"  # Replace with actual broker IP
     STATUS_TOPIC = "bot/state"
     SENSORS_TOPIC = "bot/sensors"
     CONTROL_TOPIC = "bot/motors"
-    Kp = 0.5  # Proportional gain
+    Kp = 0.1  # Proportional gain
     Kd = 0.0  # Derivative gain
+    CAPTURE_DEVICE = 1
     TARGET_IMAGE_WIDTH = 640  # Consistent image width
     SAFE_ZONE_RADIUS = 5  # Safe zone radius in pixels
     TARGET_FPS = 10  # Target FPS for frame processing
+
+    # Motor speed limits
     MAX_LEFT_SPEED = 200
     MAX_RIGHT_SPEED = 200
     MIN_LEFT_PWM = 50  # Minimum PWM value for left motor
     MIN_RIGHT_PWM = 50  # Minimum PWM value for right motor
-    STOP_DISTANCE_THRESHOLD = 50  # Lidar distance threshold (cm)
     DETECTION_TIMEOUT = 45  # Timeout for detecting a target (seconds)
     NAVIGATION_TIMEOUT = 3  # Timeout for losing a target during navigation (seconds)
+
+    # Dynamic target and reference objects for pickup and delivery states
+    pickup_target = "person"
+    pickup_object = "cup"
+    dropoff_target = "person"
+    dropoff_reference = "cell phone"
 
 # Logger setup
 logging.basicConfig(level=logging.INFO)
@@ -40,6 +50,38 @@ class State(Enum):
     DETECT_DELIVERY_LOCATION = "detect_delivery_location"
     SHIPPING = "shipping"
     DELIVERY = "delivery"
+
+class MQTTHandler:
+    def __init__(self, broker, state_machine):
+        self.client = mqtt.Client()
+        self.client.on_connect = self._on_connect
+        self.client.on_message = self._on_message
+        self.state_machine = state_machine
+        self.client.connect(broker)
+        self.client.loop_start()
+
+    def _on_connect(self, client, userdata, flags, rc):
+        logger.info("Connected to MQTT broker.")
+        # Subscribe to necessary topics
+        self.client.subscribe([(Config.STATUS_TOPIC, 0), (Config.SENSORS_TOPIC, 0)])
+
+    def _on_message(self, client, userdata, msg):
+        payload = json.loads(msg.payload.decode())
+        logger.info(f"Message received on topic {msg.topic}: {payload}")
+
+        # Handle events or commands based on the topic
+        if "event" in payload:
+            # Handle event messages from the ESP
+            self.state_machine.handle_event(payload["event"])
+        elif "state" in payload:
+            state_value = payload["state"]
+            # Ignore confirmation messages (ending with "_started")
+            if state_value.endswith("_started"):
+                logger.info(f"State confirmation received: {state_value}")
+                return
+            # Handle new state commands
+            logger.info(f"State change command received: {state_value}")
+            self.state_machine.handle_event(state_value)
 
 # Motor Control Class
 class MotorControl:
@@ -80,9 +122,6 @@ class VisionSystem:
     def __init__(self):
         self.current_model = None
         self.current_model_name = ""
-        self.PERSON_ID = 0  # Assuming detection of 'person'
-        self.object_id = 41  # Secondary object (e.g., 'cup')
-        self.load_model('yolo11s')  # Load the model at initialization
 
     def load_model(self, model_name):
         try:
@@ -95,7 +134,7 @@ class VisionSystem:
             logger.error(f"Failed to load model '{model_name}': {e}")
             self.current_model = None
 
-    def process_detection_frame(self, frame, detect_cup=False):
+    def process_detection_frame(self, frame, detect_target, detect_reference=None, require_both=False):
         if not self.current_model:
             logger.error("YOLO model not loaded. Ensure the model is available at boot-up.")
             raise RuntimeError("YOLO model not loaded. Ensure it is available at boot-up.")
@@ -104,19 +143,28 @@ class VisionSystem:
         resized_frame = cv2.resize(frame, (Config.TARGET_IMAGE_WIDTH, target_height))
         results = self.current_model(resized_frame, conf=0.6, verbose=False)
 
-        # Filter for person and optional secondary object
-        valid_classes = [self.PERSON_ID]
-        if detect_cup and self.object_id is not None:
-            valid_classes.append(self.object_id)
+        # Get class indexes for target and reference
+        target_id = object_index_json.get(detect_target)
+        reference_id = object_index_json.get(detect_reference) if detect_reference else None
 
-        filtered_boxes = [box for box in results[0].boxes if box.cls in valid_classes]
+        # Filter detections for target and reference classes
+        target_boxes = [box for box in results[0].boxes if box.cls == target_id]
+        reference_boxes = [box for box in results[0].boxes if box.cls == reference_id] if reference_id is not None else []
 
-        # Select the largest target box
-        target_box = None
-        if filtered_boxes:
-            target_box = max(filtered_boxes, key=lambda box: (box.xyxy[0][2] - box.xyxy[0][0]) * (box.xyxy[0][3] - box.xyxy[0][1]))
+        # Update the YOLO results to show only target and reference
+        results[0].boxes = target_boxes + reference_boxes
+        processed_frame = results[0].plot()
 
-        return results[0].plot(), target_box
+        # Determine objects presence based on the requirement
+        if require_both:
+            objects_present = bool(target_boxes and reference_boxes)
+        else:
+            objects_present = bool(target_boxes)
+
+        return processed_frame, target_boxes, objects_present
+
+
+
 
 # Robot State Machine
 class RobotStateMachine:
@@ -138,6 +186,7 @@ class RobotStateMachine:
             State.SHIPPING: self._shipping,
             State.DELIVERY: self._delivery
         }
+
     def handle_event(self, event):
         logger.info(f"Received event: {event}, Current state: {self.current_state}")
         if self.current_state == State.BOOT_UP and event == "robot_initialized":
@@ -145,7 +194,6 @@ class RobotStateMachine:
         elif self.current_state == State.AWAIT_ACTIVATION and event == "imu_tap_detected":
             self.transition_to_state(State.DETECT_PICKUP_LOCATION)
         elif self.current_state == State.DETECT_PICKUP_LOCATION and event == "person_detected":
-            logger.info("Person detected. Stopping motors and transitioning to retrieval.")
             self.motor_control.stop()
             self.transition_to_state(State.RETRIEVAL)
         elif self.current_state == State.RETRIEVAL and event == "lidar_threshold_met":
@@ -190,24 +238,47 @@ class RobotStateMachine:
             self.printed_states.add(State.DETECT_PICKUP_LOCATION)
             self.motor_control.move(-70, 70)  # Slow turn left
 
-        processed_frame, target_box = self.vision_system.process_detection_frame(frame, detect_cup=True)
-        if target_box:
+        # Process the frame and check if both target and reference are present
+        processed_frame, _, objects_present = self.vision_system.process_detection_frame(
+            frame, Config.pickup_target, Config.pickup_object, require_both=True
+        )
+
+        # Add annotation for object presence
+        if objects_present:
+            cv2.putText(processed_frame, "Target and Reference Found", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
             logger.info("Person and cup detected in pickup location.")
             self.motor_control.stop()
             self.mqtt_client.publish(Config.SENSORS_TOPIC, json.dumps({"event": "person_detected"}))
             logger.info("Event published: person_detected")
-        elif time.time() - self.state_start_time > Config.DETECTION_TIMEOUT:
+        else:
+            cv2.putText(processed_frame, "Searching for Target and Reference", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            logger.info("Still searching for target and reference...")
+
+        # Handle timeout
+        if time.time() - self.state_start_time > Config.DETECTION_TIMEOUT:
             logger.warning("Timeout in pickup location. Returning to await activation.")
             self.transition_to_state(State.AWAIT_ACTIVATION)
+
         return processed_frame
+
+
+
 
     def _retrieval(self, frame):
         if State.RETRIEVAL not in self.printed_states:
             logger.info("Retrieval: Navigating to target.")
             self.printed_states.add(State.RETRIEVAL)
 
-        processed_frame, target_box = self.vision_system.process_detection_frame(frame)
-        if target_box:
+        # Use require_both=True to ensure both target and reference are detected
+        processed_frame, target_boxes, objects_present = self.vision_system.process_detection_frame(
+            frame, Config.pickup_target, Config.pickup_object, require_both=True
+        )
+
+        if objects_present and target_boxes:
+            # Get the largest target box (assuming there may be more than one)
+            target_box = max(target_boxes, key=lambda box: (box.xyxy[0][2] - box.xyxy[0][0]) * (box.xyxy[0][3] - box.xyxy[0][1]))
+            
+            # Calculate PD control error
             box_center_x = int((target_box.xyxy[0][0] + target_box.xyxy[0][2]) / 2)
             img_center_x = Config.TARGET_IMAGE_WIDTH // 2
             error = box_center_x - img_center_x
@@ -216,23 +287,45 @@ class RobotStateMachine:
             adjustment = Config.Kp * error + Config.Kd * derivative
             self.motor_control.previous_error = error
 
+            # Calculate motor PWM values
             left_pwm = 100 - adjustment
             right_pwm = 100 + adjustment
             self.motor_control.move(int(left_pwm), int(right_pwm))
+
+            # Draw safe zone (indicated by two green vertical lines)
+            safe_left = img_center_x - Config.SAFE_ZONE_RADIUS
+            safe_right = img_center_x + Config.SAFE_ZONE_RADIUS
+            cv2.line(processed_frame, (safe_left, 0), (safe_left, processed_frame.shape[0]), (0, 255, 0), 2)
+            cv2.line(processed_frame, (safe_right, 0), (safe_right, processed_frame.shape[0]), (0, 255, 0), 2)
+
+            # Draw a line through the center of the target box (blue)
+            cv2.line(processed_frame, (box_center_x, 0), (box_center_x, processed_frame.shape[0]), (255, 0, 0), 2)
+
+            # Annotate the frame with error and PWM values
+            cv2.putText(processed_frame, f"Error: {error}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            cv2.putText(processed_frame, f"Left PWM: {int(left_pwm)}", (10, processed_frame.shape[0] - 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            cv2.putText(processed_frame, f"Right PWM: {int(right_pwm)}", (10, processed_frame.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+            # Annotate if target is in the safe zone
+            if abs(error) <= Config.SAFE_ZONE_RADIUS:
+                cv2.putText(processed_frame, "In Safe Zone", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
         else:
-            logger.warning("Target lost in retrieval.")
+            logger.warning("Target or reference lost in retrieval.")
             if time.time() - self.state_start_time > Config.NAVIGATION_TIMEOUT:
                 logger.warning("Target lost timeout. Returning to detect pickup location.")
                 self.transition_to_state(State.DETECT_PICKUP_LOCATION)
 
         return processed_frame
 
+
+
     def _procurement(self, frame):
-        if State.PROCUREMENT not in self.printed_states:
-            logger.info("Procurement: Waiting for cup placement.")
-            self.printed_states.add(State.PROCUREMENT)
-            self.motor_control.stop()
-        return frame
+            if State.PROCUREMENT not in self.printed_states:
+                logger.info("Procurement: Waiting for cup placement.")
+                self.printed_states.add(State.PROCUREMENT)
+                self.motor_control.stop()
+            return frame
 
     def _detect_delivery_location(self, frame):
         if State.DETECT_DELIVERY_LOCATION not in self.printed_states:
@@ -240,23 +333,44 @@ class RobotStateMachine:
             self.printed_states.add(State.DETECT_DELIVERY_LOCATION)
             self.motor_control.move(-70, 70)  # Slow turn left
 
-        processed_frame, target_box = self.vision_system.process_detection_frame(frame)
-        if target_box:
-            logger.info("Person detected in delivery location.")
+        # Process the frame and check if both target and reference are present
+        processed_frame, _, objects_present = self.vision_system.process_detection_frame(
+            frame, Config.dropoff_target, Config.dropoff_reference, require_both=True
+        )
+
+        # Add annotation for object presence
+        if objects_present:
+            cv2.putText(processed_frame, "Target and Reference Found", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            logger.info("Person and bottle detected in delivery location.")
             self.motor_control.stop()
             self.transition_to_state(State.SHIPPING)
-        elif time.time() - self.state_start_time > Config.DETECTION_TIMEOUT:
+        else:
+            cv2.putText(processed_frame, "Searching for Target and Reference", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            logger.info("Still searching for target and reference...")
+
+        # Handle timeout
+        if time.time() - self.state_start_time > Config.DETECTION_TIMEOUT:
             logger.warning("Timeout in delivery location. Returning to await activation.")
             self.transition_to_state(State.AWAIT_ACTIVATION)
+
         return processed_frame
+
 
     def _shipping(self, frame):
         if State.SHIPPING not in self.printed_states:
             logger.info("Shipping: Navigating to delivery point.")
             self.printed_states.add(State.SHIPPING)
 
-        processed_frame, target_box = self.vision_system.process_detection_frame(frame)
-        if target_box:
+        # Use require_both=True to ensure both target and reference are detected
+        processed_frame, target_boxes, objects_present = self.vision_system.process_detection_frame(
+            frame, Config.dropoff_target, Config.dropoff_reference, require_both=True
+        )
+
+        if objects_present and target_boxes:
+            # Get the largest target box (assuming there may be more than one)
+            target_box = max(target_boxes, key=lambda box: (box.xyxy[0][2] - box.xyxy[0][0]) * (box.xyxy[0][3] - box.xyxy[0][1]))
+
+            # Calculate PD control error
             box_center_x = int((target_box.xyxy[0][0] + target_box.xyxy[0][2]) / 2)
             img_center_x = Config.TARGET_IMAGE_WIDTH // 2
             error = box_center_x - img_center_x
@@ -265,11 +379,31 @@ class RobotStateMachine:
             adjustment = Config.Kp * error + Config.Kd * derivative
             self.motor_control.previous_error = error
 
+            # Calculate motor PWM values
             left_pwm = 100 - adjustment
             right_pwm = 100 + adjustment
             self.motor_control.move(int(left_pwm), int(right_pwm))
+
+            # Draw safe zone (indicated by two green vertical lines)
+            safe_left = img_center_x - Config.SAFE_ZONE_RADIUS
+            safe_right = img_center_x + Config.SAFE_ZONE_RADIUS
+            cv2.line(processed_frame, (safe_left, 0), (safe_left, processed_frame.shape[0]), (0, 255, 0), 2)
+            cv2.line(processed_frame, (safe_right, 0), (safe_right, processed_frame.shape[0]), (0, 255, 0), 2)
+
+            # Draw a line through the center of the target box (blue)
+            cv2.line(processed_frame, (box_center_x, 0), (box_center_x, processed_frame.shape[0]), (255, 0, 0), 2)
+
+            # Annotate the frame with error and PWM values
+            cv2.putText(processed_frame, f"Error: {error}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            cv2.putText(processed_frame, f"Left PWM: {int(left_pwm)}", (10, processed_frame.shape[0] - 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            cv2.putText(processed_frame, f"Right PWM: {int(right_pwm)}", (10, processed_frame.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+            # Annotate if target is in the safe zone
+            if abs(error) <= Config.SAFE_ZONE_RADIUS:
+                cv2.putText(processed_frame, "In Safe Zone", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
         else:
-            logger.warning("Target lost in shipping.")
+            logger.warning("Target or reference lost in shipping.")
             if time.time() - self.state_start_time > Config.NAVIGATION_TIMEOUT:
                 logger.warning("Target lost timeout. Returning to detect delivery location.")
                 self.transition_to_state(State.DETECT_DELIVERY_LOCATION)
@@ -282,87 +416,53 @@ class RobotStateMachine:
             self.printed_states.add(State.DELIVERY)
             self.motor_control.stop()
         return frame
-
-# MQTT Handler
-class MQTTHandler:
-    def __init__(self, broker, state_machine):
-        self.client = mqtt.Client()
-        self.client.on_connect = self._on_connect
-        self.client.on_message = self._on_message
-        self.state_machine = state_machine
-        self.client.connect(broker)
-        self.client.loop_start()
-
-    def _on_connect(self, client, userdata, flags, rc):
-        logger.info("Connected to MQTT broker.")
-        # Subscribe to necessary topics
-        self.client.subscribe([(Config.STATUS_TOPIC, 0), (Config.SENSORS_TOPIC, 0)])
-
-    def _on_message(self, client, userdata, msg):
-        payload = json.loads(msg.payload.decode())
-        logger.info(f"Message received on topic {msg.topic}: {payload}")
-
-        # Handle events or commands based on the topic
-        if "event" in payload:
-            # Handle event messages from the ESP
-            self.state_machine.handle_event(payload["event"])
-        elif "state" in payload:
-            state_value = payload["state"]
-            # Ignore confirmation messages (ending with "_started")
-            if state_value.endswith("_started"):
-                logger.info(f"State confirmation received: {state_value}")
-                return
-            # Handle new state commands
-            logger.info(f"State change command received: {state_value}")
-            self.state_machine.handle_event(state_value)
-
-# Annotate Frame Function
-def annotate_frame(frame, state_text=None, fps_text=None):
-    if state_text:
-        cv2.putText(frame, f"State: {state_text}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-    if fps_text:
-        text_size, _ = cv2.getTextSize(fps_text, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)
-        text_x = frame.shape[1] - text_size[0] - 10
-        cv2.putText(frame, fps_text, (text_x, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-    return frame
-
 # Main Loop
+
 def main():
-    vid = cv2.VideoCapture(0)
+    vid = cv2.VideoCapture(Config.CAPTURE_DEVICE)
     mqtt_client = mqtt.Client()
     mqtt_client.connect(Config.MQTT_BROKER)
     motor_control = MotorControl(mqtt_client, Config.CONTROL_TOPIC)
     vision_system = VisionSystem()
 
+    vision_system.load_model('yolo11s')  # Load the detection model
     state_machine = RobotStateMachine(motor_control, vision_system, mqtt_client)
+
+    # Instantiate the MQTT handler to manage state changes via MQTT messages
     mqtt_handler = MQTTHandler(Config.MQTT_BROKER, state_machine)
 
     cv2.namedWindow("Robot Interface", cv2.WINDOW_NORMAL)
-
     previous_time = time.time()
 
-    while True:
-        ret, frame = vid.read()
-        if not ret:
-            break
+    try:
+        while True:
+            ret, frame = vid.read()
+            if not ret:
+                break
 
-        #cv2.setWindowProperty("Robot Interface", cv2.WND_PROP_TOPMOST, 1)
+            frame = state_machine.execute_current_state(frame)
 
-        frame = state_machine.execute_current_state(frame)
+            current_time = time.time()
+            fps = 1 / (current_time - previous_time)
+            previous_time = current_time
 
-        current_time = time.time()
-        fps = 1 / (current_time - previous_time)
-        previous_time = current_time
+            # Annotate the frame with current state and FPS
+            state_text = f"State: {state_machine.current_state.name}"
+            fps_text = f"FPS: {int(fps)}"
+            cv2.putText(frame, state_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            cv2.putText(frame, fps_text, (frame.shape[1] - 150, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
-        frame = annotate_frame(frame, state_text=state_machine.current_state.name, fps_text=f"FPS: {int(fps)}")
+            cv2.imshow("Robot Interface", frame)
 
-        cv2.imshow("Robot Interface", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-    vid.release()
-    cv2.destroyAllWindows()
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt received. Shutting down gracefully.")
+    finally:
+        vid.release()
+        cv2.destroyAllWindows()
+        logger.info("Program shut down.")
 
 if __name__ == "__main__":
     main()

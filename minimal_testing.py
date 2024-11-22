@@ -91,13 +91,17 @@ def visual_navigation(frame, target_object, reference_object):
         frame: The current frame from the video capture.
         target_object: The primary object to navigate to (e.g., "person").
         reference_object: The secondary object used for target selection refinement (e.g., "cup").
+
+    Returns:
+        processed_frame: The frame with annotations.
+        objects_present: Boolean indicating if both target and reference objects are present.
     """
     target_index = object_index_json.get(target_object)
     reference_index = object_index_json.get(reference_object)
 
     if target_index is None or reference_index is None:
         logger.error("Both target and reference objects must be provided and valid.")
-        return frame
+        return frame, False
 
     # Process the frame and get YOLO results
     results = vision_system.process_detection_frame(frame)
@@ -106,11 +110,6 @@ def visual_navigation(frame, target_object, reference_object):
     # Filter detections for target and reference objects
     target_boxes = [box for box in detections if box.cls == target_index]
     reference_boxes = [box for box in detections if box.cls == reference_index]
-
-    if not reference_boxes:
-        logger.warning("No reference objects detected. Stopping motors.")
-        motor_control.move(0, 0)
-        return frame
 
     # Assign filtered boxes back to the results object for plotting
     results[0].boxes = target_boxes + reference_boxes
@@ -125,6 +124,22 @@ def visual_navigation(frame, target_object, reference_object):
     safe_right = img_center_x + safe_zone_radius
     cv2.line(processed_frame, (safe_left, 0), (safe_left, processed_frame.shape[0]), (0, 255, 0), 2)
     cv2.line(processed_frame, (safe_right, 0), (safe_right, processed_frame.shape[0]), (0, 255, 0), 2)
+
+    objects_present = bool(target_boxes) and bool(reference_boxes)
+
+    if not reference_boxes:
+        # Reference object not found
+        cv2.putText(
+            processed_frame,
+            f"No {reference_object} found",
+            (10, processed_frame.shape[0] - 100),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (0, 0, 255),
+            2,
+        )
+        motor_control.move(0, 0)
+        return processed_frame, False
 
     # Navigation logic
     chosen_target = None
@@ -142,33 +157,42 @@ def visual_navigation(frame, target_object, reference_object):
                 for rb in reference_boxes
             ),
         )
-
-    if chosen_target:
-        # Calculate error and annotate
-        box_center_x = int((chosen_target.xyxy[0][0] + chosen_target.xyxy[0][2]) / 2)
-        error = box_center_x - img_center_x
-        cv2.line(processed_frame, (box_center_x, 0), (box_center_x, processed_frame.shape[0]), (255, 0, 0), 2)
-        cv2.putText(processed_frame, f"Error: {error}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-
-        # PD control for motor adjustment
-        derivative = error - motor_control.previous_error
-        adjustment = Config.Kp * error + Config.Kd * derivative
-        motor_control.previous_error = error
-
-        # Determine motor speeds
-        if abs(error) <= safe_zone_radius:
-            # If within the safe zone, move forward
-            left_pwm = right_pwm = 150  # Forward speed
-        else:
-            # Adjust motor speeds to turn towards the target
-            left_pwm = 100 - adjustment
-            right_pwm = 150 + adjustment
-
-        # Send motor commands
-        motor_control.move(int(left_pwm), int(right_pwm))
     else:
-        # Stop motors if no target is found
+        # Target object not found
+        cv2.putText(
+            processed_frame,
+            f"No {target_object} found",
+            (10, processed_frame.shape[0] - 140),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (0, 0, 255),
+            2,
+        )
         motor_control.move(0, 0)
+        return processed_frame, False
+
+    # Calculate error and annotate
+    box_center_x = int((chosen_target.xyxy[0][0] + chosen_target.xyxy[0][2]) / 2)
+    error = box_center_x - img_center_x
+    cv2.line(processed_frame, (box_center_x, 0), (box_center_x, processed_frame.shape[0]), (255, 0, 0), 2)
+    cv2.putText(processed_frame, f"Error: {error}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+    # PD control for motor adjustment
+    derivative = error - motor_control.previous_error
+    adjustment = Config.Kp * error + Config.Kd * derivative
+    motor_control.previous_error = error
+
+    # Determine motor speeds
+    if abs(error) <= safe_zone_radius:
+        # If within the safe zone, move forward
+        left_pwm = right_pwm = 150  # Forward speed
+    else:
+        # Adjust motor speeds to turn towards the target
+        left_pwm = 100 - adjustment
+        right_pwm = 150 + adjustment
+
+    # Send motor commands
+    motor_control.move(int(left_pwm), int(right_pwm))
 
     # Annotate motor PWM values
     cv2.putText(
@@ -190,7 +214,7 @@ def visual_navigation(frame, target_object, reference_object):
         2,
     )
 
-    return processed_frame
+    return processed_frame, objects_present
 
 # Main loop for video processing and motor control
 def main():
@@ -204,21 +228,24 @@ def main():
     vision_system.load_model('yolo11s')  # Load the detection model
     previous_time = time.time()
 
-    while True:
-        ret, frame = vid.read()
-        if not ret:
-            break
+while True:
+    ret, frame = vid.read()
+    if not ret:
+        break
 
-        # Specify navigation targets
-        processed_frame = visual_navigation(frame, target_object="person", reference_object="cup")
+    # Specify navigation targets
+    processed_frame, objects_present = visual_navigation(frame, target_object="person", reference_object="cup")
 
-        # Display the processed frame
-        cv2.imshow("Robot Interface", processed_frame)
+    # Log object presence status
+    logger.info(f"Objects Present: {objects_present}")
 
-        # Exit if 'q' is pressed
-        key = cv2.waitKey(1)
-        if key == ord('q'):
-            break
+    # Display the processed frame
+    cv2.imshow("Robot Interface", processed_frame)
+
+    # Exit if 'q' is pressed
+    key = cv2.waitKey(1)
+    if key == ord('q'):
+        break
 
     mqtt_client.loop_stop()
     vid.release()

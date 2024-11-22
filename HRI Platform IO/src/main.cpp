@@ -227,10 +227,10 @@ void cupDetected() {
     int sensorValue = analogRead(photoPin);
     float voltage = sensorValue * (3.3 / 4095.0);
     // Serial.print("Photoresistor Voltage: ");
-    // Serial.println(voltage);
+    Serial.println(voltage);
 
     // Check the state to determine action
-    if (currentState == PROCUREMENT && voltage < 1.8) {
+    if (currentState == PROCUREMENT && voltage < 1.2) {
         // Cup placed in PROCUREMENT state
         mqttClient.publish(sensorsTopic, "{\"event\": \"cup_placed\"}");
         Serial.println("Event published: cup_placed");
