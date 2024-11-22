@@ -1,4 +1,5 @@
 import paho.mqtt.client as mqtt
+# SIMPLE MOTOR TESTING PROGRAM WITH MQTT
 
 # MQTT Broker details
 broker = "10.243.82.33"

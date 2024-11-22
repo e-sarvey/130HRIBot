@@ -7,6 +7,11 @@ import paho.mqtt.client as mqtt
 import numpy as np
 from classes import object_index_json
 
+'''
+This program was used to develop the desired computer vision algorithm using the data from the yolo model.
+'''
+
+
 # Configurations and Constants
 class Config:
     MQTT_BROKER = "10.243.82.33"  # Replace with actual broker IP

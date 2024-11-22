@@ -1,5 +1,3 @@
-# Updated Robot State Machine with Dynamic Object Detection and Navigation
-
 from enum import Enum
 import cv2
 import json
@@ -9,15 +7,18 @@ from ultralytics import YOLO
 import paho.mqtt.client as mqtt
 from classes import object_index_json
 
-# Configurations and Constants
+# Logger setup for better debugging flexability
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 class Config:
-    MQTT_BROKER = "10.243.82.33"  # Replace with actual broker IP
+    MQTT_BROKER = "10.243.82.33" 
     STATUS_TOPIC = "bot/state"
     SENSORS_TOPIC = "bot/sensors"
     CONTROL_TOPIC = "bot/motors"
     Kp = 0.1  # Proportional gain
     Kd = 0.0  # Derivative gain
-    CAPTURE_DEVICE = 1
+    CAPTURE_DEVICE = 1 # Capture device 0 is built in camera, 0 is continunity camera (iphone)
     TARGET_IMAGE_WIDTH = 640  # Consistent image width
     SAFE_ZONE_RADIUS = 5  # Safe zone radius in pixels
     TARGET_FPS = 10  # Target FPS for frame processing
@@ -36,11 +37,6 @@ class Config:
     dropoff_target = "person"
     dropoff_reference = "cell phone"
 
-# Logger setup
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# State Enum
 class State(Enum):
     BOOT_UP = "boot_up"
     AWAIT_ACTIVATION = "await_activation"
@@ -52,6 +48,8 @@ class State(Enum):
     DELIVERY = "delivery"
 
 class MQTTHandler:
+    '''This class contains methods related to subscribing, publishing and managing MQTT connection'''
+
     def __init__(self, broker, state_machine):
         self.client = mqtt.Client()
         self.client.on_connect = self._on_connect
@@ -83,8 +81,9 @@ class MQTTHandler:
             logger.info(f"State change command received: {state_value}")
             self.state_machine.handle_event(state_value)
 
-# Motor Control Class
 class MotorControl:
+    '''This class has methods for controling the robot motors via mqtt commands and setting up the mqtt connection'''
+
     def __init__(self, mqtt_client, control_topic):
         self.client = mqtt_client
         self.control_topic = control_topic
@@ -117,8 +116,9 @@ class MotorControl:
             return min(pwm, -min_pwm)
         return 0  # No movement
 
-# Vision System Class
 class VisionSystem:
+    ''' This class is used to manage the computer vision processing and the setup and use of the yolo11 object detection model'''
+
     def __init__(self):
         self.current_model = None
         self.current_model_name = ""
@@ -163,11 +163,8 @@ class VisionSystem:
 
         return processed_frame, target_boxes, objects_present
 
-
-
-
-# Robot State Machine
 class RobotStateMachine:
+    ''' This class defines the actions required for each state and manages transitions between states as well as the logging and communication with the ESP'''
     def __init__(self, motor_control, vision_system, mqtt_client):
         self.current_state = State.BOOT_UP
         self.motor_control = motor_control
@@ -261,9 +258,6 @@ class RobotStateMachine:
 
         return processed_frame
 
-
-
-
     def _retrieval(self, frame):
         if State.RETRIEVAL not in self.printed_states:
             logger.info("Retrieval: Navigating to target.")
@@ -317,9 +311,7 @@ class RobotStateMachine:
                 self.transition_to_state(State.DETECT_PICKUP_LOCATION)
 
         return processed_frame
-
-
-
+    
     def _procurement(self, frame):
             if State.PROCUREMENT not in self.printed_states:
                 logger.info("Procurement: Waiting for cup placement.")
@@ -354,7 +346,6 @@ class RobotStateMachine:
             self.transition_to_state(State.AWAIT_ACTIVATION)
 
         return processed_frame
-
 
     def _shipping(self, frame):
         if State.SHIPPING not in self.printed_states:
@@ -416,8 +407,10 @@ class RobotStateMachine:
             self.printed_states.add(State.DELIVERY)
             self.motor_control.stop()
         return frame
-# Main Loop
 
+################
+### MAIN LOOP ##
+################
 def main():
     vid = cv2.VideoCapture(Config.CAPTURE_DEVICE)
     mqtt_client = mqtt.Client()
@@ -441,18 +434,15 @@ def main():
                 break
 
             frame = state_machine.execute_current_state(frame)
-
             current_time = time.time()
             fps = 1 / (current_time - previous_time)
             previous_time = current_time
-
-            # Annotate the frame with current state and FPS
             state_text = f"State: {state_machine.current_state.name}"
             fps_text = f"FPS: {int(fps)}"
             cv2.putText(frame, state_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
             cv2.putText(frame, fps_text, (frame.shape[1] - 150, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
-            cv2.imshow("Robot Interface", frame)
+            cv2.imshow("Robot Interface", frame) # display the frame
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break

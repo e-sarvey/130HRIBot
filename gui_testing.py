@@ -3,7 +3,11 @@ import threading
 import dearpygui.dearpygui as dpg
 import paho.mqtt.client as mqtt
 
-# MQTT Configurations
+'''
+This program was developed to provide a simple user interface to send simulated data to test the state transitions in main.py and monitor state response messages.
+This program uses the dearpygui library for the interface creation which is rendered using the gpu in one thread while the mqtt is handled in another.
+'''
+
 # MQTT_BROKER = "10.243.82.33"
 MQTT_BROKER = "10.0.0.25"
 STATUS_TOPIC = "bot/state"
@@ -44,12 +48,12 @@ mqtt_thread = threading.Thread(target=mqtt_loop)
 mqtt_thread.daemon = True
 mqtt_thread.start()
 
-# Publish Simulated Events
+# Publish Simulated Events with MQTT
 def publish_event(event_name):
     client.publish(SENSORS_TOPIC, json.dumps({"event": event_name}))
     print(f"Simulated Event Published: {event_name}")
 
-# DearPyGui Setup
+
 dpg.create_context()
 
 with dpg.window(label="State Transition Tester", width=600, height=400):

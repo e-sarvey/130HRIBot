@@ -1,3 +1,4 @@
+# yolo11 pretrained dataset class dictionary mapping names to their indicies in the results object
 object_index_json = {
     'person': 0, 'bicycle': 1, 'car': 2, 'motorcycle': 3, 'airplane': 4, 'bus': 5, 'train': 6, 'truck': 7,
     'boat': 8, 'traffic light': 9, 'fire hydrant': 10, 'stop sign': 11, 'parking meter': 12, 'bench': 13,
